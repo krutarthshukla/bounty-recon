@@ -3,7 +3,10 @@
 # Installs all tools needed beyond what subdomain-recon already provides.
 # Run once. Idempotent.
 
-set -euo pipefail
+# NOT -e: this is a best-effort installer — one tool/step failing must never
+# abort the whole toolchain (every step already guards itself with || warn).
+# An early -e abort is what once left every vuln tool uninstalled mid-run.
+set -uo pipefail
 
 TOOLS_DIR="$HOME/.recon-tools"
 GOBIN="$TOOLS_DIR/bin"

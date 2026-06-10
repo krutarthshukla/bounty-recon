@@ -8,9 +8,32 @@ set -euo pipefail
 export PATH="$HOME/.recon-tools/bin:$PATH"
 source ~/.recon-tools/activate.sh 2>/dev/null || true
 
-ORG="${1:?Usage: run_all.sh <OrgName> <domains> [collab_host]}"
-DOMAINS="${2:?Provide comma-separated domains}"
-COLLAB="${3:-}"
+# ── Input — the ONLY thing the user provides ─────────────────────────────────
+# A single field: an ORG NAME, or one/many DOMAINS (mode auto-detected). An
+# optional 2nd arg is the collaborator host for blind XSS/SSRF.
+#   • bare org name   ("Acme")             → MODE=org:    discover owned roots
+#                                            (via subdomain-recon), then scan them.
+#   • one/many domains ("a.com,b.io")      → MODE=domain: scan exactly those.
+RAW="${1:?Usage: run_all.sh \"<org name | domain | domain1,domain2,...>\" [collab_host]}"
+COLLAB="${2:-}"
+
+is_domainish() { [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9-]+)+$ ]]; }
+MODE="org"; DOMAINS=""
+IFS=',' read -ra _RAWTOKS <<< "$RAW"
+_any=0; _all_dom=1
+for _t in "${_RAWTOKS[@]}"; do
+    _t="$(echo "$_t" | xargs)"; [ -z "$_t" ] && continue; _any=1
+    is_domainish "$_t" || { _all_dom=0; break; }
+done
+if [ "$_any" -eq 1 ] && [ "$_all_dom" -eq 1 ]; then
+    MODE="domain"
+    DOMAINS="$(echo "$RAW" | tr 'A-Z' 'a-z' | tr ',' '\n' | tr -d ' \t' | grep . | sort -u | paste -sd, -)"
+    _label="$(echo "${DOMAINS%%,*}" | awk -F. '{ n=NF;
+        if (n>=3 && ($(n-1)=="co"||$(n-1)=="com"||$(n-1)=="net"||$(n-1)=="org"||$(n-1)=="gov"||$(n-1)=="edu"||$(n-1)=="ac")) print $(n-2); else print $(n-1) }')"
+    ORG="$(echo "${_label:0:1}" | tr 'a-z' 'A-Z')${_label:1}"
+else
+    MODE="org"; ORG="$RAW"
+fi
 
 # ── Per-run output dir on Desktop: <Org>_<timestamp> (reports + full log) ─────
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -61,8 +84,9 @@ echo "  ║        bounty-recon pipeline         ║"
 echo "  ║  recon → vulns → report              ║"
 echo "  ╚══════════════════════════════════════╝"
 echo -e "${NC}"
+echo "  Mode:    $MODE"
 echo "  Org:     $ORG"
-echo "  Domains: $DOMAINS"
+[ "$MODE" = "domain" ] && echo "  Domains: $DOMAINS" || echo "  Domains: (discover from org)"
 echo "  Output:  $OUTPUT"
 [ -n "$COLLAB" ] && echo "  Collab:  $COLLAB (SSRF/blind XSS enabled)"
 echo ""
@@ -112,37 +136,31 @@ export PATH="$TOOLS_DIR/bin:$PATH"
     || ok "tool check complete (any still-missing tools will degrade gracefully)"
 echo ""
 
-# ── Phase 1: Subdomain recon (via subdomain-recon scripts — not modified) ─────
-banner "Phase 1 — Subdomain Recon (subdomain-recon)"
-python3 "$V2_SCRIPTS/passive_enum.py" \
-  --domains "$DOMAINS" --output "$WD/subdomains.txt"
-ok "Passive: $(grep -cv '^#' "$WD/subdomains.txt" 2>/dev/null || echo 0) subdomains"
-
-# Advanced techniques in parallel
-info "Running 25 advanced techniques..."
-> "$WD/advanced.txt"
-pids=()
-for domain in $(echo "$DOMAINS" | tr ',' '\n'); do
-  python3 "$V2_SCRIPTS/advanced_techniques.py" \
-    --domain "$domain" --org "$ORG" \
-    --output "$WD/adv_${domain}.txt" 2>/dev/null &
-  pids+=($!)
-done
-for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
-cat "$WD"/adv_*.txt >> "$WD/advanced.txt" 2>/dev/null || true
-
-# Merge + cache. `|| true`: empty results make grep exit 1 (not a failure here).
-cat "$WD/subdomains.txt" "$WD/advanced.txt" 2>/dev/null \
-  | grep -v "^#\|^\*\.\|^$" | tr '[:upper:]' '[:lower:]' | grep "\." \
-  | sort -u > "$WD/all_subdomains.txt" || true
-[ -f "$WD/all_subdomains.txt" ] || : > "$WD/all_subdomains.txt"
-
-# Persistent cache
-CACHE="$HOME/.recon-cache/$(echo "$ORG" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '_')_subdomains.txt"
-mkdir -p "$HOME/.recon-cache"
-[ -f "$CACHE" ] && cat "$CACHE" >> "$WD/all_subdomains.txt" && sort -u "$WD/all_subdomains.txt" -o "$WD/all_subdomains.txt"
-cp "$WD/all_subdomains.txt" "$CACHE"
-ok "Total subdomains: $(wc -l < "$WD/all_subdomains.txt")"
+# ── Phase 1: Subdomain recon — reuse an existing run, else run the full engine ─
+# bounty-recon's recon IS subdomain-recon's flow. Normally it runs that engine
+# nested under our run dir (SR_RUNDIR) and consumes its outputs. But if the
+# caller already has a subdomain-recon result, set BR_REUSE_SUBS (a subdomain
+# list) [+ BR_REUSE_ROOTS (owned roots)] to reuse it and skip re-running recon —
+# i.e. "use the domains & subs from subdomain-recon only."
+banner "Phase 1 — Subdomain Recon"
+if [ -n "${BR_REUSE_SUBS:-}" ] && [ -s "${BR_REUSE_SUBS:-/nonexistent}" ]; then
+  info "reusing existing subdomain-recon results: $BR_REUSE_SUBS"
+  cp "$BR_REUSE_SUBS" "$WD/all_subdomains.txt"
+  if [ -n "${BR_REUSE_ROOTS:-}" ] && [ -s "${BR_REUSE_ROOTS:-/nonexistent}" ]; then
+    DOMAINS="$(grep . "$BR_REUSE_ROOTS" | paste -sd, -)"
+  fi
+else
+  info "running full subdomain-recon engine (discover + validate + enumerate)"
+  SR_RUNDIR="$RUNDIR/recon" bash "$V2_SCRIPTS/run_all.sh" "$RAW" \
+    || warn "subdomain-recon engine ended early — continuing with whatever it produced"
+  cp "$RUNDIR/recon/work/all_unique.txt" "$WD/all_subdomains.txt" 2>/dev/null || : > "$WD/all_subdomains.txt"
+  if [ -s "$RUNDIR/recon/owned_roots.txt" ]; then
+    DOMAINS="$(grep . "$RUNDIR/recon/owned_roots.txt" | paste -sd, -)"
+  fi
+fi
+[ -z "$DOMAINS" ] && DOMAINS="$(echo "$RAW" | tr 'A-Z' 'a-z' | tr -d ' ')"
+ok "Recon scope (roots): $DOMAINS"
+ok "Total subdomains: $(wc -l < "$WD/all_subdomains.txt" 2>/dev/null || echo 0)"
 
 # ── Phase 2: Live probe ───────────────────────────────────────────────────────
 banner "Phase 2 — Live Probe + Screenshots"
@@ -159,7 +177,7 @@ if command -v gowitness &>/dev/null || [ -f "$HOME/.recon-tools/bin/gowitness" ]
     -f "$WD/live.txt" \
     --screenshot-path "$WD/screenshots/" \
     --no-http --threads 10 2>/dev/null || true
-  ok "Screenshots: $(ls "$WD/screenshots/"*.png 2>/dev/null | wc -l)"
+  ok "Screenshots: $(find "$WD/screenshots" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')"
 fi
 ok "Live hosts: $(wc -l < "$WD/live.txt")"
 
@@ -194,7 +212,7 @@ fi
 GITHUB_REPOS_ARG="--github-repos $WD/github_repos.json"
 
 # ── Phase 4: Vulnerability scanning ──────────────────────────────────────────
-banner "Phase 4 — Vulnerability Scanning (9 automated phases)"
+banner "Phase 4 — Vulnerability Scanning (22 automated phases A–W)"
 COLLAB_ARG=""
 [ -n "$COLLAB" ] && COLLAB_ARG="--collab $COLLAB"
 
@@ -255,14 +273,16 @@ echo -e "${BOLD}  DONE${NC}"
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo "  Org:         $ORG"
-echo "  Subdomains:  $(wc -l < "$WD/all_subdomains.txt")"
-echo "  Live hosts:  $(wc -l < "$WD/live.txt")"
+echo "  Subdomains:  $(wc -l < "$WD/all_subdomains.txt" 2>/dev/null || echo 0)"
+echo "  Live hosts:  $(wc -l < "$WD/live.txt" 2>/dev/null || echo 0)"
 echo "  Findings:    $TOTAL"
-echo -e "  Report (MD): ${GREEN}$OUTPUT${NC}"
-echo -e "  Report (PDF):${GREEN}$PDF_OUT${NC}"
-echo -e "  Log:         ${GREEN}$LOG${NC}"
 echo ""
-echo -e "  ${GREEN}✔ Reports and full log saved in: $RUNDIR${NC}"
+echo -e "  ${GREEN}✔ Output dir:${NC} $RUNDIR"
+echo -e "  ${BOLD}Main outputs:${NC}"
+echo -e "     • $(basename "$OUTPUT")  — HackerOne-style report (findings by severity)"
+echo -e "     • $(basename "$PDF_OUT")  — same report as a PDF"
+echo -e "     • run.log  — full run log (every phase + tool)"
+echo -e "  Everything else in the dir (recon/, screenshots/, *.json) is supporting/debug output."
 echo ""
 
 # Show finding counts by severity

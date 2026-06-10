@@ -40,9 +40,17 @@ Usage:
     --out    /tmp/bounty_findings.json
 """
 
-import argparse, json, os, re, subprocess, sys, time
+import argparse, json, os, re, ssl, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+
+# Untrusted/invalid TLS certs are common in recon scope. Don't let them make the
+# raw urllib POSTs below (GraphQL introspection/mutation, mass-assignment) raise
+# SSLError and get swallowed — that silently skips every HTTPS host with a
+# self-signed/invalid cert. Verify off, like the rest of the recon tooling.
+_NOVERIFY_SSL = ssl.create_default_context()
+_NOVERIFY_SSL.check_hostname = False
+_NOVERIFY_SSL.verify_mode = ssl.CERT_NONE
 
 GOBIN = os.path.expanduser("~/.recon-tools/bin")
 SKILL_DIR = os.path.dirname(__file__)
@@ -138,9 +146,9 @@ def phase_nuclei(live_file):
         tool("nuclei"), "-l", live_file,
         "-severity", "critical,high",
         "-tags", "cve,exposure,misconfig,panel,default-login,takeover",
-        "-rate-limit", "100",
-        "-bulk-size", "25",
-        "-concurrency", "10",
+        "-rate-limit", "500",
+        "-bulk-size", "50",
+        "-concurrency", "25",
         "-timeout", "10",
         "-silent",
         "-jsonl",
@@ -152,6 +160,12 @@ def phase_nuclei(live_file):
             ev = json.loads(line)
             sev = ev.get("info", {}).get("severity", "info").lower()
             if sev in ("critical", "high", "medium"):
+                # nuclei emits cwe-id as a LIST (e.g. ["CWE-79"]); take the first
+                # element so report.py builds a valid MITRE link instead of the
+                # broken "['CWE-79']" string.
+                _cwe = ev.get("info", {}).get("classification", {}).get("cwe-id", "")
+                if isinstance(_cwe, list):
+                    _cwe = _cwe[0] if _cwe else ""
                 finding(
                     title=ev.get("info", {}).get("name", "Unknown"),
                     severity=sev,
@@ -159,7 +173,7 @@ def phase_nuclei(live_file):
                     detail=ev.get("info", {}).get("description", ""),
                     evidence=ev.get("matched-at", "") + " " + str(ev.get("extracted-results", "")),
                     cvss=ev.get("info", {}).get("classification", {}).get("cvss-score", 0.0),
-                    cwe=str(ev.get("info", {}).get("classification", {}).get("cwe-id", "")),
+                    cwe=_cwe,
                 )
                 count += 1
         except Exception:
@@ -188,7 +202,7 @@ def phase_xss(urls_file, collab_host=""):
         tmp = tmp_f.name
 
         dalfox_cmd = [tool("dalfox"), "file", tmp, "--silence", "--no-color",
-                      "--output-all", "--format", "json"]
+                      "--worker", "200", "--output-all", "--format", "json"]
         if collab_host:
             dalfox_cmd += ["-b", collab_host]
 
@@ -722,6 +736,7 @@ def phase_ports(live_file):
         out = run([
             tool("naabu"), "-l", tmp_f.name,
             "-p", INTERESTING_PORTS,
+            "-c", "50", "-rate", "1000",
             "-silent", "-json"
         ], timeout=120)
     finally:
@@ -828,7 +843,7 @@ def phase_graphql(live_file):
                     data=INTROSPECTION.encode(),
                     headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
                 )
-                resp_data = urllib.request.urlopen(req, timeout=8).read().decode()
+                resp_data = urllib.request.urlopen(req, timeout=8, context=_NOVERIFY_SSL).read().decode()
                 if "__schema" in resp_data or "queryType" in resp_data:
                     finding("GraphQL Introspection Enabled", "medium", f"{host}{path}",
                             "GraphQL schema fully exposed via introspection — reveals all mutations/queries",
@@ -840,7 +855,7 @@ def phase_graphql(live_file):
                     f"{host}{path}", data=MUTATION.encode(),
                     headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
                 )
-                resp2 = urllib.request.urlopen(req2, timeout=8).read().decode()
+                resp2 = urllib.request.urlopen(req2, timeout=8, context=_NOVERIFY_SSL).read().decode()
                 if "data" in resp2 and "errors" not in resp2:
                     finding("GraphQL Mutation Without Authentication", "high", f"{host}{path}",
                             "GraphQL mutation accessible without auth token",
@@ -910,7 +925,7 @@ def phase_mass_assignment(live_file, urls_file):
                 req = urllib.request.Request(url, data=payload.encode(),
                     headers={"Content-Type":"application/json","User-Agent":"Mozilla/5.0"},
                     method="PATCH")
-                resp = urllib.request.urlopen(req, timeout=5)
+                resp = urllib.request.urlopen(req, timeout=5, context=_NOVERIFY_SSL)
                 content = resp.read().decode()
                 if resp.status in (200, 201) and any(
                     k in content for k in ["admin","role","privilege","superuser"]):
@@ -964,7 +979,7 @@ def phase_vhost(live_file, domain):
         try:
             run([ffuf, "-u", host + "/", "-H", f"Host: FUZZ.{domain}",
                  "-w", wordlist, "-mc", "200,301,302,403",
-                 "-fs", "0", "-t", "50", "-timeout", "5",
+                 "-fs", "0", "-t", "100", "-timeout", "5",
                  "-o", out_file, "-of", "json", "-s"], timeout=60)
             if os.path.isfile(out_file):
                 try:
@@ -1048,8 +1063,9 @@ def phase_nosql(urls_file):
                         f"MongoDB operator injection error triggered: {payload}",
                         evidence=content[:200], cwe="CWE-943", cvss=9.8)
                 count += 1
-            elif status in (200, 302) and payload in url:
-                # Size-based detection
+            elif status in (200, 302):
+                # Size-based detection. (The injected request `modified` != `url`
+                # is already guaranteed above, so the response reflects the payload.)
                 normal, _, _ = get(url, timeout=5)
                 if abs(len(content) - len(normal)) > 50:
                     finding("Potential NoSQL Injection (Response Diff)", "high", url,
@@ -1195,26 +1211,43 @@ def phase_kiterunner(live_file):
     try:
         tmp_f.write("\n".join(hosts)); tmp_f.close()
         out = run([kr, "scan", tmp_f.name, "-w", kite,
-                   "-x", "5", "-j", "20", "-o", "json", "--fail-status-codes", "404,400",
+                   "-x", "10", "-j", "50", "-o", "json", "--fail-status-codes", "404,400",
                    "--quiet"], timeout=600)
     finally:
         try: os.unlink(tmp_f.name)
         except OSError: pass
 
     count = 0
-    for line in out.splitlines():
-        line = line.strip()
-        if not line.startswith("{"): continue
+    # kiterunner's `-o json` may emit a JSON array OR one object per line depending
+    # on the build — accept both so an output-format change doesn't silently drop
+    # every result. If nothing parses, say so (visible during a live run).
+    events = []
+    stripped = out.strip()
+    if stripped:
         try:
-            ev = json.loads(line)
-        except json.JSONDecodeError: continue
+            parsed = json.loads(stripped)
+            events = parsed if isinstance(parsed, list) else [parsed]
+        except json.JSONDecodeError:
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        events.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        if not events:
+            print("  [-] kiterunner ran but emitted no parseable JSON "
+                  "(check `kr` version / `-o json` support)", flush=True)
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
         target_url = ev.get("url", "") or ev.get("target", "")
         status = ev.get("status", 0) or ev.get("status_code", 0)
         if status in (200, 201, 204, 301, 302, 401, 403):
             sev = "high" if status == 200 else "medium"
             finding(f"Shadow API Route ({status})", sev, target_url,
                     f"kiterunner hit on undocumented API route — HTTP {status}",
-                    evidence=line[:200], cwe="CWE-285",
+                    evidence=str(ev)[:200], cwe="CWE-285",
                     cvss=7.5 if sev == "high" else 5.3)
             count += 1
     print(f"  [+] Kiterunner: {count} new API routes", flush=True)
@@ -1243,7 +1276,7 @@ def phase_crlfuzz(urls_file):
     tmp_f = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
     try:
         tmp_f.write("\n".join(urls)); tmp_f.close()
-        out = run([crf, "-l", tmp_f.name, "-c", "20", "-s"], timeout=180)
+        out = run([crf, "-l", tmp_f.name, "-c", "40", "-s"], timeout=180)
     finally:
         try: os.unlink(tmp_f.name)
         except OSError: pass
@@ -1251,11 +1284,23 @@ def phase_crlfuzz(urls_file):
     count = 0
     for line in out.splitlines():
         line = line.strip()
-        if line.startswith("VULN") or "[CRLF]" in line or "[+]" in line and "crlf" in line.lower():
-            finding("CRLF Injection", "high", line[:200],
-                    "crlfuzz confirmed CRLF injection — can chain to XSS, header injection, cache poisoning",
-                    evidence=line[:300], cwe="CWE-93", cvss=7.4)
-            count += 1
+        if not line:
+            continue
+        # crlfuzz -s (silent) prints vulnerable URLs one per line; older/non-silent
+        # builds prefix a [VLN]/VULN marker. Treat either as a hit, and pull the
+        # URL out for the finding. (The old condition mis-parsed both: `and` bound
+        # tighter than `or`, and silent output has none of those markers.)
+        is_hit = (line.startswith("http")
+                  or line.startswith("VULN") or "[VLN]" in line.upper()
+                  or ("[+]" in line and "crlf" in line.lower()))
+        if not is_hit:
+            continue
+        m = re.search(r'https?://[^\s\'"]+', line)
+        url = m.group(0) if m else line[:200]
+        finding("CRLF Injection", "high", url,
+                "crlfuzz confirmed CRLF injection — can chain to XSS, header injection, cache poisoning",
+                evidence=line[:300], cwe="CWE-93", cvss=7.4)
+        count += 1
     print(f"  [+] CRLF: {count} findings", flush=True)
 
 
@@ -1431,6 +1476,9 @@ def phase_cloud_enum(org):
                 evidence=line[:300], cwe="CWE-200",
                 cvss=7.5 if sev == "high" else 5.3)
         count += 1
+    if not out.strip():
+        print("  [-] cloud_enum produced no output "
+              "(check install / flag compatibility for this version)", flush=True)
     print(f"  [+] Cloud enum: {count} exposed assets", flush=True)
 
 

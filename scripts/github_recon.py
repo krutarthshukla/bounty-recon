@@ -152,40 +152,41 @@ def list_org_members(org_login):
     return members
 
 
-def find_users_by_email_domain(domains):
-    """GitHub commit search for authors using the company email domain.
+def find_repos_by_email_domain(domains, cap=120):
+    """Find repos that hardcode a company email address — a real secret-leak
+    vector — via GitHub CODE SEARCH for the literal "@<domain>".
 
-    Returns set of (login, email) pairs. Commit search needs the `cloak-preview`
-    media type historically; gh handles that. Limited to ~1000 results by GitHub.
+    Why not commit search: GitHub commit search does NOT support author-email
+    domain wildcards. The previous queries (`author-email:/@domain$/` and
+    `@domain in:author-email`) are not valid qualifiers, so they silently
+    returned zero and this whole LIKELY tier was dead. Code search for the
+    "@<domain>" string is supported and surfaces personal/forked repos with a
+    checked-in config / .env containing a company email.
+
+    Returns a list of (repo_dict, evidence_str).
     """
-    found = OrderedDict()  # preserve insertion order; key=login
+    out = OrderedDict()  # key=full_name → (repo, evidence); preserves order
     for domain in domains:
         d = domain.strip().lower()
         if not d:
             continue
-        # Quoted to avoid GitHub interpreting `.` as a query operator
-        q = f'author-email:/@{re.escape(d)}$/'
-        print(f"[*] Commit search for authors @{d} …", flush=True)
-        # search/commits uses ?q= and per_page; --paginate caps at 1000 results
-        results = gh_api(
-            f"search/commits?q={q}&per_page=100&sort=author-date&order=desc",
-            paginate=False,
-        )
+        print(f"[*] Code search for \"@{d}\" (hardcoded company emails)…", flush=True)
+        # %22%40 = the URL-encoded "@ — matches the literal email pattern in code.
+        results = gh_api(f"search/code?q=%22%40{d}%22&per_page=100", paginate=False)
         items = results.get("items", []) if isinstance(results, dict) else []
-        if not items:
-            # Fallback: simpler query (some GH instances reject regex form)
-            q2 = f'@{d} in:author-email'
-            results = gh_api(f"search/commits?q={q2.replace(' ', '+')}&per_page=100", paginate=False)
-            items = results.get("items", []) if isinstance(results, dict) else []
         for item in items:
-            author = item.get("author") or {}
-            login = author.get("login")
-            email = (item.get("commit", {}).get("author") or {}).get("email", "")
-            if login and email.lower().endswith(f"@{d}"):
-                if login not in found:
-                    found[login] = email
-        print(f"  [+] Authors using @{d}: {len(found)} unique", flush=True)
-    return found
+            repo = item.get("repository") or {}
+            fn = repo.get("full_name")
+            if not fn or fn in out:
+                continue
+            path = item.get("path", "")
+            out[fn] = (repo, f"Code hardcodes company email @{d} ({path})")
+            if len(out) >= cap:
+                break
+        print(f"  [+] Repos mentioning @{d}: {len(out)} unique so far", flush=True)
+        if len(out) >= cap:
+            break
+    return list(out.values())
 
 
 def list_user_repos(user_login, per_user_cap=30):
@@ -204,7 +205,9 @@ def build_repo_entry(repo, tier, evidence):
     return {
         "full_name": repo.get("full_name"),
         "html_url": repo.get("html_url"),
-        "clone_url": repo.get("clone_url"),
+        "clone_url": (repo.get("clone_url")
+                      or (f"https://github.com/{repo.get('full_name')}.git"
+                          if repo.get("full_name") else None)),
         "owner": (repo.get("owner") or {}).get("login"),
         "owner_type": (repo.get("owner") or {}).get("type"),
         "tier": tier,
@@ -249,29 +252,13 @@ def main():
         print("[!] Could not resolve an official GitHub org. Skipping CONFIRMED tier.",
               flush=True)
 
-    # ── 2. Pivot via company email domain → LIKELY ─────────────────────────
-    email_authors = find_users_by_email_domain(domains)
-    if email_authors:
-        # Cap to avoid blowing the rate budget
-        capped = list(email_authors.items())[:args.max_email_authors]
-        print(f"[*] Enumerating personal repos of {len(capped)} email-pivot authors…",
-              flush=True)
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(list_user_repos, login): (login, email)
-                       for login, email in capped}
-            for fut in as_completed(futures):
-                login, email = futures[fut]
-                try:
-                    user_repos = fut.result()
-                except Exception:
-                    continue
-                for r_ in user_repos:
-                    fn = r_.get("full_name")
-                    if not fn or fn in repos_by_full_name:
-                        continue
-                    repos_by_full_name[fn] = build_repo_entry(
-                        r_, "LIKELY",
-                        [f"Owner committed with company email {email}"])
+    # ── 2. Pivot via company email domain (GitHub code search) → LIKELY ─────
+    email_repos = find_repos_by_email_domain(domains, cap=args.max_email_authors * 2)
+    for repo, evidence in email_repos:
+        fn = repo.get("full_name")
+        if not fn or fn in repos_by_full_name:
+            continue
+        repos_by_full_name[fn] = build_repo_entry(repo, "LIKELY", [evidence])
 
     # ── 3. Pivot via public org membership → LIKELY (when not already seen) ─
     if org_login:

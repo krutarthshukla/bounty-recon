@@ -8,10 +8,10 @@ Where most point-and-shoot scanners stop at Nuclei templates, this chains the wh
 
 ## What it does
 
-- **Enumerates subdomains** by handing off to `subdomain-recon` — no changes, just reuses it.
+- **Enumerates subdomains** by handing the whole recon stage to `subdomain-recon`'s engine — org → discover + validate owned roots + full enumeration (passive, advanced, brute / permutations / TLS-SAN); domains → those directly. The exact same flow `subdomain-recon` runs standalone.
 - **Probes what's live and screenshots it.** `httpx` for tech detection, `gowitness` for screenshots, so admin panels and login pages jump out at you.
 - **Collects URLs** from the Wayback Machine, GAU (Wayback + CommonCrawl + AlienVault + URLScan), and an active `katana` crawl.
-- **Pivots through GitHub.** Resolves the official GitHub org and discovers personal repos owned by likely employees — via public org membership and commit-author email-domain pivoting (e.g. finds anyone who's pushed code with `*@acme.com` to a personal repo). Each repo is tiered `CONFIRMED` / `LIKELY` / `POSSIBLE` based on the evidence.
+- **Pivots through GitHub.** Resolves the official GitHub org (CONFIRMED tier) and discovers employees' personal repos two ways: public org membership, and **code search for `"@acme.com"`** — surfacing repos that hardcode a company email in a checked-in config / `.env` (the real leak vector). Each repo is tiered `CONFIRMED` / `LIKELY` / `POSSIBLE`.
 - **Scans for verified leaked secrets** with **TruffleHog v3** across both the harvested JS bundles and every discovered GitHub repo. `--only-verified` means each match is test-fired against its provider's API before flagging — no regex false positives.
 - **Runs 22 automated vulnerability checks** — Nuclei CVEs, XSS, SSRF, CORS, open redirect, exposed sensitive files, verified secret scanning, SQLi screening, port scan, JWT attacks, host-header injection, GraphQL deep test, SSTI, mass assignment, vhost discovery, shadow APIs, NoSQL injection, JSLuice AST-based JS analysis, Kiterunner API shadow-route discovery, CRLF injection, 403/401 bypass, source-map exposure, and Azure/GCP cloud asset enum.
 - **Points you at the manual stuff.** It flags likely IDOR, auth, and business-logic candidates — the bugs automation can find but can't confirm.
@@ -58,34 +58,36 @@ source ~/.recon-tools/activate.sh
 
 ## Quick start
 
-One command does the whole run and drops the report on your Desktop:
+One command does the whole run. Give it **either** an org name **or** one/more
+domains (mode auto-detected); an optional collaborator host turns on blind XSS/SSRF:
 
 ```bash
-bash scripts/run_all.sh "Acme Corp" "acme.com,product.io"
+# Org name → discover + validate roots, enumerate, then scan everything
+bash scripts/run_all.sh "Acme Corp"
+
+# Domains → recon + scan exactly those
+bash scripts/run_all.sh "acme.com,product.io"
 
 # Add a collaborator host to catch blind XSS and SSRF
-bash scripts/run_all.sh "Acme Corp" "acme.com,product.io" your.collab.host
+bash scripts/run_all.sh "Acme Corp" your.collab.host
 ```
 
-You'll get two files on your Desktop:
-- `<OrgName>_bounty_report.md` — the full Markdown writeup
-- `<OrgName>_bounty_report.pdf` — the same thing as a PDF for sharing
+Everything for a run lands under `~/Desktop/<Org>_<timestamp>/`:
+- `<Org>_bounty_report.md` / `.pdf` — the HackerOne-style writeup
+- `run.log`, `recon/` (the nested subdomain-recon run), and `findings_partial.json` if interrupted
 
 ## Flags
 
-You call it with positional arguments:
-
 ```bash
-bash scripts/run_all.sh "<OrgName>" "<domain1,domain2>" [collab_host]
+bash scripts/run_all.sh "<org name | domain | domain1,domain2,...>" [collab_host]
 ```
 
 | Argument | Required | What it does |
 |----------|----------|--------------|
-| `<OrgName>` | yes | Name used for the cache and report filenames |
-| `<domains>` | yes | Comma-separated seed domains to recon |
+| target | yes | An **org name** (→ discover + validate + enumerate every owned root, then scan) **or** one/more comma-separated **domains** (→ recon + scan exactly those). Auto-detected. |
 | `collab_host` | no | A Burp Collaborator / interactsh host. Supplying it turns on blind XSS and SSRF detection; leave it out and those two checks are skipped. |
 
-That's the only optional knob — everything else runs automatically, there are no other switches.
+That's the only optional knob — everything else runs automatically.
 
 ## How it works
 
@@ -100,8 +102,8 @@ You give it an org and some domains; it runs recon, then scanning, then reportin
    └──────────────┬───────────────┘
                   │
    ┌──────────────▼───────────────┐
-   │ Phase 1   Subdomain Recon     │  delegates to subdomain-recon
-   │                               │  (passive + advanced enumeration)
+   │ Phase 1   Subdomain Recon     │  delegates to subdomain-recon's full
+   │                               │  engine (discover+validate+enumerate)
    └──────────────┬───────────────┘
                   │ subdomains
    ┌──────────────▼───────────────┐
@@ -115,7 +117,7 @@ You give it an org and some domains; it runs recon, then scanning, then reportin
    └──────────────┬───────────────┘
                   │ collected URLs
    ┌──────────────▼───────────────┐
-   │ Phase 4   Vulnerability Scan  │  9 automated phases (A–I)
+   │ Phase 4   Vulnerability Scan  │  22 automated phases (A–W)
    │                               │  → JSON findings
    └──────────────┬───────────────┘
                   │ findings
@@ -133,10 +135,10 @@ You give it an org and some domains; it runs recon, then scanning, then reportin
 | Phase | What it covers | Tooling | In → Out |
 |-------|----------------|---------|----------|
 | **0** | Install | bundled installer | — → toolchain in `~/.recon-tools` |
-| **1** | Subdomain recon | `subdomain-recon` (passive + advanced) | domains → subdomains |
+| **1** | Subdomain recon | `subdomain-recon` full engine (discover + validate + enumerate) | org/domains → subdomains |
 | **2** | Live probe + screenshots | `httpx`, `gowitness` | subdomains → live hosts + screenshots |
 | **3** | URL collection | Wayback, GAU, katana | live hosts → collected URLs |
-| **4** | Vulnerability scan | Nuclei, dalfox, naabu, … (nine checks A–I, below) | live hosts + URLs → JSON findings |
+| **4** | Vulnerability scan | Nuclei, dalfox, naabu, … (22 checks A–W, below) | live hosts + URLs → JSON findings |
 | **5** | Manual-assist hunting | IDOR / auth / param discovery | URLs → candidate lists to review |
 | **6** | Report | Markdown + PDF generator | findings → `~/Desktop/<Org>_bounty_report.{md,pdf}` |
 

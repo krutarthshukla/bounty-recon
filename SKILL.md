@@ -3,290 +3,125 @@ name: bounty-recon
 owner: Krutarth Shukla
 email: krutarth.ce@gmail.com
 description: >
-  End-to-end bug bounty recon → vulnerability hunting pipeline. Starts with subdomain-recon
-  enumeration, then a GitHub repo recon pass (official org + employee personal repos via email-domain
-  pivot), then a 22-phase vulnerability scan: Nuclei critical/high CVEs, XSS (dalfox), SSRF,
-  CORS misconfig, open redirect, sensitive file exposure, TruffleHog v3 verified secret scanning
-  (JS + GitHub), SQLi screening, port scan, JWT attacks, host-header injection, GraphQL deep test,
-  SSTI, mass assignment, vhost discovery, shadow APIs, NoSQL injection, JSLuice AST-based JS
-  analysis, Kiterunner API shadow-route discovery, CRLF injection, 403/401 access-control bypass,
-  source-map exposure, and Azure/GCP cloud asset enum. Generates a HackerOne-style markdown report.
-  Use for: "bounty recon <org>", "find vulns in <org>", "bug bounty scan <org>",
-  "hunt bugs in <org>", "run bounty-recon on <org>".
-  ONLY run against targets with explicit bug bounty scope or written authorization.
+  Automated end-to-end bug-bounty recon → vulnerability-hunting pipeline. The
+  user gives ONLY an org name or one/more domains; the skill discovers owned
+  roots including acquisitions and subsidiaries (org mode), enumerates
+  subdomains, collects URLs, does GitHub repo recon,
+  runs a 22-phase vulnerability scan (Nuclei CVEs, XSS, SSRF, CORS, open redirect,
+  sensitive files, TruffleHog verified secrets, SQLi, port scan, JWT, host-header
+  injection, GraphQL, SSTI, mass assignment, vhost, content/shadow-API discovery,
+  NoSQL, JSLuice, Kiterunner, CRLF, 403/401 bypass, source maps, cloud assets) and
+  writes a HackerOne-style markdown + PDF report. Use for: "bounty recon <org>",
+  "find vulns in <org>", "bug bounty scan <org>", "hunt bugs in <org>".
+  ONLY run against targets with an active bug-bounty scope or written authorization.
 ---
 
 # bounty-recon
 
-**What it does:** Subdomain enumeration (via subdomain-recon) → URL collection → GitHub repo
-recon (official org + employee personal repos via email-domain pivot) → 22-phase vulnerability
-scan (incl. TruffleHog verified secret scanning across JS + GitHub repos) → HackerOne-style report.
+## ⚠️ Scope first
 
-**Scope reminder:** Only run against programs with an active bug bounty scope or explicit written
-authorization. Running against out-of-scope targets is illegal.
+Only run against programs with an **active bug-bounty scope or explicit written
+authorization**. Read the scope; respect out-of-scope assets strictly. No
+destructive testing. If scope isn't established, confirm it with the user before
+running.
 
----
+## First run (one-time, per machine)
 
-
-## When invoked, Claude does ALL of this automatically
-
-Just say **"bounty recon <org>"** and Claude runs the full pipeline:
+Before running, check the onboarding marker:
 
 ```bash
-# Single command — runs everything and saves report to Desktop
-bash ~/.claude/skills/bounty-recon/scripts/run_all.sh   "<OrgName>"   "domain1.com,domain2.com,..."   [your.collab.host]  # optional — enables blind XSS + SSRF detection
-
-# PDF report generated automatically alongside the markdown report
-python3 -c "
-import subprocess, sys
-subprocess.run(['pip3', 'install', 'md2pdf', '-q'])
-" && md2pdf ~/Desktop/<OrgName>_bounty_report.md      --output ~/Desktop/<OrgName>_bounty_report.pdf 2>/dev/null || python3 -c "
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
-import re, os
-# Fallback PDF generation if md2pdf unavailable
-src = open(os.path.expanduser('~/Desktop/<OrgName>_bounty_report.md')).read()
-print('PDF: use install_tools.sh to install md2pdf')
-"
+test -f ~/.recon-tools/.onboarded_bounty && echo onboarded || echo first-run
 ```
 
-**Output on Desktop:**
--  — detailed HackerOne-style markdown report
--  — PDF version for sharing
+If it prints `first-run`, **pause and confirm with the user before running** —
+bounty-recon sends active attack traffic, so this gate matters:
+- **Authorization:** confirm the target is in an active bug-bounty scope or the
+  user has written permission. Do not proceed otherwise.
+- The recon + scanning toolchain **auto-installs on this first run** (several
+  minutes, one time).
+- **GitHub:** have them run `gh auth login` so the repo/secret recon (Phase 3.5
+  + G) works; without it that phase scans only harvested JS.
+- *Optional:* a collaborator host (interactsh/Burp) enables blind XSS + SSRF —
+  pass it as the 2nd argument.
+- *Optional:* for bbot's extra coverage, run once: `bbot --install-all-deps` (sudo).
 
-## Phase 0 — Install
+After they confirm, record it so this never prompts again, then run:
 
 ```bash
-bash ~/.claude/skills/bounty-recon/scripts/install_tools.sh
-source ~/.recon-tools/activate.sh
+mkdir -p ~/.recon-tools && touch ~/.recon-tools/.onboarded_bounty
 ```
 
-New tools over subdomain-recon:
+If the marker already exists, skip this and run directly.
 
-**Core scanning:** `nuclei` (templates updated), `dalfox` (XSS), `ffuf` (fuzzer),
-`naabu` (port scan), `feroxbuster`, `subjack`, `baddns`, `sqlmap`, `gowitness`,
-`arjun`, `corsy`.
+## How to run it
 
-**URL collection / filtering:** `gau`, `waybackurls`, `katana`, `hakrawler`, `gf`,
-`qsreplace`, `kxss`, `unfurl`, `anew`, `httprobe`.
-
-**Modern recon stack (2025-2026):**
-- `trufflehog` v3 — verified-only secret scanning (replaces regex). Live-fires
-  candidates against provider APIs (AWS, GitHub, Slack, Stripe, …) before flagging.
-- `jsluice` — BishopFox AST-based JS analyzer for endpoints + secret candidates.
-- `kr` (kiterunner) — Assetnote API content discovery with 800k+ Swagger-scraped
-  routes; content-type-aware fuzzing finds shadow REST endpoints.
-- `cdncheck`, `tlsx` — ProjectDiscovery: CDN fingerprinting + TLS/cert intel.
-- `cloud_enum` — Multi-cloud public asset hunter (Azure storage/vaults, GCP buckets,
-  Firebase RTDB). Closes the gap S3Scanner doesn't cover.
-- `s3scanner` — S3 bucket enum (also installed).
-- `sourcemapper` — Recovers original TS/JSX source from leaked `.js.map` files.
-- `crlfuzz` — CRLF injection at scale.
-- `bypass-403` — 403/401 access-control bypass kit.
-- `x8` — Hidden parameter discovery (body/query/headers; better than arjun for headers).
-- `graphw00f` / `clairvoyance` / `graphql-cop` — GraphQL deep test (engine fingerprint,
-  schema recovery when introspection is off, batching/DoS/CSRF audits).
-
----
-
-## Phase 1 — Subdomain Recon (calls subdomain-recon — no modifications)
+The user gives **one thing** — an org name, a single domain, or a comma-list of
+domains (optionally a collaborator host for blind XSS/SSRF). Take that input
+verbatim and run the engine. It does the entire pipeline automatically; do
+**not** step through phases yourself.
 
 ```bash
-ORG="<OrgName>"
-DOMAINS="<domain1.com,domain2.com,...>"
-
-python3 ~/.claude/skills/subdomain-recon/scripts/passive_enum.py \
-  --domains "$DOMAINS" --output /tmp/br_passive.txt
-
-# Advanced techniques (25 techniques from subdomain-recon)
-for domain in $(echo "$DOMAINS" | tr ',' '\n'); do
-  python3 ~/.claude/skills/subdomain-recon/scripts/advanced_techniques.py \
-    --domain "$domain" --org "$ORG" \
-    --output "/tmp/br_adv_${domain}.txt" 2>/dev/null &
-done; wait
-cat /tmp/br_adv_*.txt >> /tmp/br_passive.txt 2>/dev/null || true
-
-sort -u /tmp/br_passive.txt -o /tmp/br_subdomains.txt
-echo "Subdomains: $(wc -l < /tmp/br_subdomains.txt)"
+bash ~/.claude/skills/bounty-recon/scripts/run_all.sh "<the user's input>" [collab_host]
 ```
 
----
-
-## Phase 2 — Live Probe + Screenshot
+Examples — pass exactly what the user said:
 
 ```bash
-# Find live hosts
-"$HOME/.recon-tools/bin/httpx" -l /tmp/br_subdomains.txt \
-  -threads 300 -timeout 5 -status-code -title -tech-detect \
-  2>/dev/null | tee /tmp/br_live.txt | wc -l
-
-# Screenshot all live hosts (visual recon — spot admin panels, login pages)
-"$HOME/.recon-tools/bin/gowitness" file \
-  -f /tmp/br_live.txt \
-  --screenshot-path /tmp/br_screenshots/ \
-  --no-http 2>/dev/null || true
-echo "Screenshots: $(ls /tmp/br_screenshots/*.png 2>/dev/null | wc -l)"
+bash ~/.claude/skills/bounty-recon/scripts/run_all.sh "Acme"                       # org name
+bash ~/.claude/skills/bounty-recon/scripts/run_all.sh "acme.com"                    # one domain
+bash ~/.claude/skills/bounty-recon/scripts/run_all.sh "acme.com,acme.io"            # several domains
+bash ~/.claude/skills/bounty-recon/scripts/run_all.sh "Acme" interact.sh            # org + collaborator
 ```
 
----
+**Mode is auto-detected from the input:**
 
-## Phase 3 — URL Collection
+| Input | What the engine does |
+|-------|----------------------|
+| **Org name** (e.g. `Acme`) | Discovers candidate roots, validates which are owned (via subdomain-recon), then runs the full pipeline over **every owned root**. |
+| **One / several domains** | Runs the pipeline over **exactly those domains** — no root discovery. |
 
-```bash
-bash ~/.claude/skills/bounty-recon/scripts/url_collect.sh \
-  /tmp/br_live.txt /tmp/br_urls.txt
-echo "Total URLs: $(wc -l < /tmp/br_urls.txt)"
-```
+The optional 2nd arg is a **collaborator host** (e.g. an interactsh domain) — it
+enables blind-XSS and SSRF out-of-band detection. Omit it if you don't have one.
 
-Sources: Wayback Machine, GAU (Wayback+CommonCrawl+AlienVault+URLScan), Katana active crawler
+First run on a fresh machine auto-installs the toolchain (`install_tools.sh`) —
+this can take several minutes; let it finish. Subsequent runs skip it.
+GitHub repo recon (Phase 3.5) uses the `gh` CLI's existing auth — if `gh` isn't
+authenticated, that phase is skipped and Phase G scans harvested JS only.
 
----
+## Reading the output
 
-## Phase 3.5 — GitHub Repo Recon (for verified-secret scan)
+Everything for a run lands in one self-contained directory:
+`~/Desktop/<Org>_<timestamp>/`
 
-Developers leak company secrets into GitHub all the time — often in **personal**
-repos where they checked in a config file with a company email. This phase
-discovers candidate repos to scan in Phase G:
+- `run.log` — full stdout/stderr of every phase.
+- `<Org>_bounty_report.md` / `.pdf` — the HackerOne-style report (findings by
+  severity + a subdomain summary).
+- `findings_partial.json` — written if the run is interrupted.
+- `rejected_domains.txt` — (org mode) roots excluded by ownership validation.
 
-| Tier | Source | Confidence |
-|------|--------|------------|
-| `CONFIRMED` | Repo under the resolved official GitHub org | Highest |
-| `LIKELY` | Personal repo whose author committed with a company-domain email, OR who is a public member of the official org | High |
-| `POSSIBLE` | Personal repo mentioning the company name/domain in code (currently surfaced only when explicit search expands the set) | Medium |
+When the engine finishes, summarize for the user: mode, scope (roots scanned),
+subdomain/live/URL counts, and the finding counts by severity (critical/high/
+medium/low) with the report path. Flag anything the log marked degraded/skipped.
 
-```bash
-python3 ~/.claude/skills/bounty-recon/scripts/github_recon.py \
-  --org    "$ORG" \
-  --domains "$DOMAINS" \
-  --output /tmp/br_github_repos.json \
-  [--org-handle <official_github_org_login>]   # optional, skips search
-```
+## Pipeline (reference only — the engine runs all of this; you don't)
 
-Discovery uses the `gh` CLI's existing auth (no extra `GITHUB_TOKEN` needed).
-TruffleHog (Phase G) auto-sources `GITHUB_TOKEN` from `gh auth token` when
-the env var isn't set.
+1. **Phase 0 — Tools.** Verify/auto-install the recon + scanning toolchains.
+2. **Phase 1 — Subdomain recon** — delegated to subdomain-recon's **full engine**
+   (org → discover roots + validate ownership + enumerate; domains → those): the
+   exact same recon flow it runs standalone, incl. brute / permutations / TLS-SAN.
+4. **Phase 2 — Live probe + screenshots** (httpx, gowitness).
+5. **Phase 3 — URL collection** (`url_collect.py`: wayback + gau).
+6. **Phase 3.5 — GitHub repo recon** (`github_recon.py`: official org +
+   email-domain / org-member pivots) → feeds Phase G.
+7. **Phase 4 — 22-phase vuln scan** (`vuln_scan.py`, A–W, one shot): Nuclei, XSS,
+   SSRF, CORS, open redirect, sensitive files, TruffleHog verified secrets, SQLi,
+   ports, JWT, host-header, GraphQL, SSTI, mass assignment, vhost, content/shadow
+   APIs, NoSQL, JSLuice, Kiterunner, CRLF, 403/401 bypass, source maps, cloud enum.
+8. **Phase 5 — Report** (`report.py`) and **Phase 6 — PDF** (`pdf_report.py`).
 
----
+## Manual-assist follow-ups (highest-paying bug classes)
 
-## Phase 4 — Vulnerability Scanning (22 phases automated)
-
-```bash
-python3 ~/.claude/skills/bounty-recon/scripts/vuln_scan.py \
-  --live          /tmp/br_live.txt \
-  --urls          /tmp/br_urls.txt \
-  --domain        "$(echo $DOMAINS | cut -d, -f1)" \
-  --org           "$ORG" \
-  --out           /tmp/br_findings.json \
-  --github-repos  /tmp/br_github_repos.json  \  # from Phase 3.5
-  [--collab       YOUR.COLLABORATOR.HOST]      # enables SSRF + blind XSS detection
-```
-
-**22 automated phases (A–W):**
-
-| Phase | Technique | Finds |
-|-------|-----------|-------|
-| A | **Nuclei** critical/high templates | CVEs, exposed panels, default creds, takeovers |
-| B | **XSS** (gf + dalfox) | Reflected, stored, DOM XSS |
-| C | **SSRF** (gf + qsreplace + collab) | Server-Side Request Forgery |
-| D | **CORS** (origin reflection test) | Credential-bearing cross-origin access |
-| E | **Open Redirect** (gf + qsreplace) | Phishing enablers |
-| F | **Sensitive files** (ffuf-style) | .git, .env, /admin, /actuator, swagger |
-| G | **Secrets** (TruffleHog v3, verified-only) | Live API keys / tokens / DB creds in JS bundles + GitHub repos discovered in Phase 3.5 |
-| H | **SQLi screening** (gf + error detection) | SQL injection candidates |
-| I | **Port scan** (naabu) | Exposed DBs, Redis, SSH, VNC |
-| J | **JWT attacks** | alg:none, RS256↔HS256 confusion, kid injection, weak secret |
-| K | **Host header injection** | Password reset poisoning, cache poisoning |
-| L | **GraphQL** | Introspection, mutation auth bypass, batching |
-| M | **SSTI** | Polyglot → per-engine RCE confirmation |
-| N | **Mass assignment** | `is_admin:true` / `role:admin` accepted in API PUT/PATCH |
-| O | **VHost discovery** | Host-header fuzzing finds apps not in DNS |
-| P | **Content discovery** | feroxbuster with Assetnote wordlists |
-| Q | **Shadow APIs** | Old `/v1/` endpoints still live after `/v2/` ships |
-| R | **JSLuice** (AST JS analysis) | Endpoints + secret candidates inside minified bundles |
-| S | **Kiterunner** (API shadow-route discovery) | Undocumented REST endpoints via 800k+ Swagger-scraped routes |
-| T | **CRLF injection** (crlfuzz) | Header injection → cache poisoning / response splitting |
-| U | **403/401 bypass** | Path tricks + header bypasses on gated endpoints |
-| V | **Source-map exposure** | Leaked `.js.map` files = full original-source disclosure |
-| W | **Cloud public-asset enum** (cloud_enum) | Open Azure storage/blobs/vaults + GCP buckets/Firebase RTDB |
-
----
-
-## Phase 5 — Manual-Assist Hunting (IDOR/Auth/Business Logic)
-
-These require human review — automation detects candidates, you validate:
-
-```bash
-# Find IDOR candidates (numeric IDs in URLs)
-cat /tmp/br_urls.txt | grep -E '/[0-9]+' | \
-  grep -v "\.js\|\.css\|\.png" | sort -u > /tmp/br_idor_candidates.txt
-echo "IDOR candidates: $(wc -l < /tmp/br_idor_candidates.txt)"
-
-# Find auth endpoints
-cat /tmp/br_urls.txt | grep -iE "login|auth|token|session|oauth|sso|jwt|password" \
-  | sort -u > /tmp/br_auth_endpoints.txt
-
-# Parameter discovery on interesting endpoints
-"$HOME/.recon-tools/bin/katana" -list /tmp/br_live.txt \
-  -jc -jsl -xhr -f qparam -d 3 -silent 2>/dev/null \
-  | sort -u > /tmp/br_params.txt
-echo "Parameters discovered: $(wc -l < /tmp/br_params.txt)"
-```
-
-**High-value bug classes to manually test (top payers on HackerOne):**
-- IDOR/BOLA — change user IDs in requests, test cross-account access
-- Auth bypass — test JWT alg=none, password reset flows, SSO misconfigs
-- Business logic — bypass rate limits, negative values, skip payment steps
-- Mass assignment — submit extra JSON fields that shouldn't be writable
-- GraphQL — introspection → hidden mutations → privilege escalation
-
----
-
-## Phase 6 — Report Generation
-
-```bash
-python3 ~/.claude/skills/bounty-recon/scripts/report.py \
-  --findings /tmp/br_findings.json \
-  --org "$ORG" \
-  --output ~/Desktop/${ORG}_bounty_report.md
-
-# Also show critical/high count
-python3 -c "
-import json
-d = json.load(open('/tmp/br_findings.json'))
-for s in ['critical','high','medium']:
-    c = sum(1 for f in d['findings'] if f['severity']==s)
-    if c: print(f'{s}: {c}')
-"
-```
-
----
-
-## Key Flags
-
-```bash
-# Enable blind XSS + SSRF with collaborator
-python3 vuln_scan.py ... --collab interact.sh
-```
-
-All vulnerability phases always run — there is no skip switch.
-
----
-
-## Bug Bounty Tips (from top hunters)
-
-- **Acquisition targets = highest ROI** — integration seams have permission model gaps
-- **Nuclei -as flag** = auto-selects templates based on tech fingerprint
-- **Auth-aware testing** = most paying bugs (IDOR, BOLA, SSRF) only exist after login
-- **gf + qsreplace pipeline** = scalable parameter fuzzing across thousands of URLs
-- **Validate before reporting** = if you can't reproduce it manually, don't submit
-- **Impact-first reports** = "An attacker can steal all user PII" beats "XSS found"
-- **Custom Nuclei templates** = find bugs others miss on the same target
-
----
-
-## Scope & Ethics
-
-- Only run against targets with active bug bounty programs or written authorization
-- Read the full scope — respect out-of-scope assets strictly
-- No destructive testing (no real `sqlmap --dump`, no DoS payloads). The SQLi phase only screens for error signatures — it never dumps data
-- Rate-limit your scans — `--rate-limit 100` in nuclei is default
+Automation surfaces candidates; these need human validation: IDOR/BOLA, auth
+bypass (JWT alg=none, password-reset/SSO flows), business-logic abuse, mass
+assignment, GraphQL introspection → hidden mutations. Validate before reporting —
+if you can't reproduce it manually, don't submit.
