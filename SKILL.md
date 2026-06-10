@@ -1,7 +1,6 @@
 ---
 name: bounty-recon
-owner: Krutarth Shukla
-email: krutarth.ce@gmail.com
+Author: Krutarth Shukla
 description: >
   Automated end-to-end bug-bounty recon → vulnerability-hunting pipeline. The
   user gives ONLY an org name or one/more domains; the skill discovers owned

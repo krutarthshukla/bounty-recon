@@ -6,6 +6,18 @@ Where most point-and-shoot scanners stop at Nuclei templates, this chains the wh
 
 > ⚠️ **Only run this where you're allowed to.** That means an active bug-bounty scope or written authorization. Scanning things outside scope can land you in real trouble.
 
+## How to use it
+
+This is a Claude Code skill, so the easiest way to run it is to just ask, in plain English:
+
+- `bounty recon Acme`
+- `bug bounty scan acme.com`
+- `find vulns in acme.com, acme.io`
+
+Give it an **org name** and it discovers and validates the owned roots before scanning everything; give it one or more **domains** and it scans exactly those. Mode is detected from your input — you don't pick. To catch blind XSS and SSRF, add a collaborator/interaction host as a second argument. The first run installs the toolchain automatically (one time), and results land in a self-contained folder under `~/Desktop/`.
+
+Prefer the terminal? The same thing runs as a single command — see [Quick start](#quick-start) below.
+
 ## What it does
 
 - **Enumerates subdomains** by handing the whole recon stage to `subdomain-recon`'s engine — org → discover + validate owned roots + full enumeration (passive, advanced, brute / permutations / TLS-SAN); domains → those directly. The exact same flow `subdomain-recon` runs standalone.
@@ -256,4 +268,4 @@ The scanner finds candidates; you confirm them. These are the classes that tend 
 
 ## Author
 
-Krutarth Shukla · krutarth.ce@gmail.com
+Krutarth Shukla
